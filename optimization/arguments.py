@@ -1,12 +1,35 @@
 import argparse
 
 
+def str2bool(v):
+    """
+    https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
+    """
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("boolean value expected")
+
+
+def add_dict_to_argparser(parser, default_dict):
+    for k, v in default_dict.items():
+        v_type = type(v)
+        if v is None:
+            v_type = str
+        elif isinstance(v, bool):
+            v_type = str2bool
+        parser.add_argument(f"--{k}", default=v, type=v_type)
+
 def get_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
     # Inputs
     parser.add_argument(
-        "-p", "--prompt", type=str, help="The prompt for the desired editing", required=True
+        "-p", "--prompt", type=str, help="The prompt for the desired editing", required=False
     )
     parser.add_argument(
         "-i", "--init_image", type=str, help="The path to the source image input", required=True
@@ -98,7 +121,7 @@ def get_arguments() -> argparse.Namespace:
         help="The filename to save, must be png",
         default="output.png",
     )
-    parser.add_argument("--iterations_num", type=int, help="The number of iterations", default=8)
+    parser.add_argument("--iterations_num", type=int, help="The number of iterations", default=1)
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -118,5 +141,31 @@ def get_arguments() -> argparse.Namespace:
         dest="export_assets",
     )
 
+    defaults = dict(
+        classifier_lambda=0,
+        dataset='imagenet',
+        data_folder=None,
+        config='imagenet1000_unet_9999_1e-4_pgd_failure.yml',
+        project_folder='/mnt/SHARED/valentyn/ACSM',
+        # ACSM
+        consistent=False,
+        step_lr=-1,
+        nsigma=1,
+        model_types=None,
+        ODI_steps=-1,
+        fid_num_samples=1,
+        begin_ckpt=1,
+        end_ckpt=1,
+        adam=False,
+        D_adam=False,
+        D_steps=0,
+        model_epoch_num=0,
+        device_ids=None,
+        script_type='sampling'
+    )
+
+    add_dict_to_argparser(parser, defaults)
+
     args = parser.parse_args()
+
     return args

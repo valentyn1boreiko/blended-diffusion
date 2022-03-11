@@ -12,6 +12,9 @@ def d_clip_loss(x, y, use_cosine=False):
 
     return distance
 
+def classifier_loss(classifier, x, y):
+
+    return classifier
 
 def range_loss(input):
     return (input - input.clamp(-1, 1)).pow(2).mean([1, 2, 3])

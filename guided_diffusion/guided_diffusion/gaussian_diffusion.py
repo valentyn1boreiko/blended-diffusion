@@ -499,15 +499,18 @@ class GaussianDiffusion:
 
             indices = tqdm(indices)
 
+        if randomize_class and "y" in model_kwargs:
+            print(model.num_classes, model_kwargs["y"].shape, model_kwargs["y"].device)
+            model_kwargs["y"] = th.randint(
+                low=0,
+                high=model.num_classes,
+                size=model_kwargs["y"].shape,
+                device=model_kwargs["y"].device,
+            )
+            print('classes start are', model_kwargs["y"])
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
-            if randomize_class and "y" in model_kwargs:
-                model_kwargs["y"] = th.randint(
-                    low=0,
-                    high=model.num_classes,
-                    size=model_kwargs["y"].shape,
-                    device=model_kwargs["y"].device,
-                )
+
             with th.no_grad():
                 out = self.p_sample(
                     model,
