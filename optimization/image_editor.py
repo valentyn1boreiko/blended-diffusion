@@ -26,7 +26,7 @@ from guided_diffusion.guided_diffusion.script_util import (
 from utils_blended.visualization import show_tensor_image, show_editied_masked_image
 
 ACSM_dir = '/mnt/SHARED/valentyn/ACSM'
-sys.path.insert(0, ACSM_dir)
+sys.path.append(ACSM_dir)
 
 print(sys.path)
 
@@ -604,6 +604,7 @@ class ImageEditor:
                     classifier_loss = loss_temp * self.args.classifier_lambda
                     loss = loss - classifier_loss
                     self.metrics_accumulator.update_metric("classifier_loss", classifier_loss.item())
+                classifier_gradient = -torch.autograd.grad(loss, x, retain_graph=True)[0].detach()
 
                 if self.args.range_lambda != 0:
                     r_loss = range_loss(out["pred_xstart"]).sum() * self.args.range_lambda
@@ -613,7 +614,7 @@ class ImageEditor:
                 if self.args.background_preservation_loss:
                     if self.mask is not None:
                         print('using mask')
-                        #masked_background = x_in * (1 - self.mask)
+                        ##masked_background = x_in * (1 - self.mask)
                         masked_background = x_in * self.mask
                     else:
                         print('not using mask')
@@ -627,13 +628,19 @@ class ImageEditor:
                         )
                     if self.args.l2_sim_lambda:
                         print('using l2 sim', self.args.l2_sim_lambda)
+
+                        print('weighting by the gradient of classifier', classifier_gradient.min(), classifier_gradient.max())
+                        classifier_gradient = (classifier_gradient - classifier_gradient.min()) / (classifier_gradient.max() - classifier_gradient.min())
+                        classifier_gradient = 1 - classifier_gradient
+                        print('reweighting by the gradient of classifier', classifier_gradient.min(), classifier_gradient.max())
+
                         loss = (
                             loss
-                            + ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda
+                            + (((masked_background - self.init_image)*classifier_gradient).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda
                             #+ mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda
                         )
-                        print('1.5 scaled loss', ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda)
-                        #print('mse scaled loss', mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda)
+                        #print('1.5 scaled loss', ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda)
+                        print('mse scaled loss', mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda)
                         print('total losss', loss)
 
                 return -torch.autograd.grad(loss, x)[0]
@@ -654,9 +661,11 @@ class ImageEditor:
             return out
 
         save_image_interval = self.diffusion.num_timesteps // 5
-        targets_classifier = [979]*4 #[293]*4 #[979]*4 #[293, 293, 293, 293] #[286, 287, 293, 288] #[979, 973, 980, 974] [286, 287, 293, 288]
+        targets_classifier = [self.args.target_class]*4 #[293]*4 #[979]*4 #[293, 293, 293, 293] #[286, 287, 293, 288] #[979, 973, 980, 974] [286, 287, 293, 288]
         for iteration_number in range(self.args.iterations_num):
-            print(f"Start iterations {iteration_number}")
+            # Here iterate over the dataloader of ImageNet-S
+
+            print(f"Start iteration {iteration_number}")
 
             samples = self.diffusion.p_sample_loop_progressive(
                 self.model,
@@ -713,6 +722,7 @@ class ImageEditor:
                         #final_distance = self.unaugmented_clip_distance(
                         #    masked_pred_image, text_embed
                         #)
+
                         final_distance = self.probs[b]
                         formatted_distance = f"{final_distance:.4f}"
 
@@ -724,8 +734,8 @@ class ImageEditor:
                            path_friendly_distance = formatted_distance.replace(".", "")
 
                            ranked_pred_path = self.ranked_results_path / (
-                                path_friendly_distance + "_" + "_" + class_labels[self.y[b].item()] + visualization_path.name
-                                # path_friendly_distance + "_" + visualization_path.name
+                               str(self.args.classifier_lambda) + "_" + str(self.args.l2_sim_lambda) + '_classifier_' + path_friendly_distance + "_" + class_labels[self.y[b].item()] + visualization_path.name
+                               #path_friendly_distance + "_" + visualization_path.name
                             )
                            pred_image_pil.save(ranked_pred_path)
 
@@ -755,7 +765,7 @@ class ImageEditor:
             Image.LANCZOS,
         )
         init = TF.to_tensor(init).to(self.device).unsqueeze(0).mul(2).sub(1)
-        targets_classifier = [979]*4 #[293]*4 #[979]*4 #[293, 293, 293, 293] #[286, 287, 293, 288] #[979, 973, 980, 974] #[286, 287, 293, 288]
+        targets_classifier = [self.args.target_class]*4 #[293]*4 #[979]*4 #[293, 293, 293, 293] #[286, 287, 293, 288] #[979, 973, 980, 974] #[286, 287, 293, 288]
         samples = self.diffusion.p_sample_loop_progressive(
             self.model,
             (1, 3, self.model_config["image_size"], self.model_config["image_size"],),

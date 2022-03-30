@@ -142,6 +142,7 @@ def get_arguments() -> argparse.Namespace:
     )
 
     defaults = dict(
+        target_class=-1,
         classifier_lambda=0,
         dataset='imagenet',
         data_folder=None,
@@ -161,7 +162,7 @@ def get_arguments() -> argparse.Namespace:
         D_steps=0,
         model_epoch_num=0,
         device_ids=None,
-        script_type='sampling'
+        script_type='sampling',
     )
 
     add_dict_to_argparser(parser, defaults)
