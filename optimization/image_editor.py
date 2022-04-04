@@ -604,7 +604,9 @@ class ImageEditor:
                     classifier_loss = loss_temp * self.args.classifier_lambda
                     loss = loss - classifier_loss
                     self.metrics_accumulator.update_metric("classifier_loss", classifier_loss.item())
-                classifier_gradient = -torch.autograd.grad(loss, x, retain_graph=True)[0].detach()
+                #classifier_gradient = -torch.autograd.grad(loss, x, retain_graph=True)[0].detach()
+                #with torch.enable_grad():
+                #    x = x.detach().requires_grad_()
 
                 if self.args.range_lambda != 0:
                     r_loss = range_loss(out["pred_xstart"]).sum() * self.args.range_lambda
@@ -629,18 +631,20 @@ class ImageEditor:
                     if self.args.l2_sim_lambda:
                         print('using l2 sim', self.args.l2_sim_lambda)
 
-                        print('weighting by the gradient of classifier', classifier_gradient.min(), classifier_gradient.max())
-                        classifier_gradient = (classifier_gradient - classifier_gradient.min()) / (classifier_gradient.max() - classifier_gradient.min())
-                        classifier_gradient = 1 - classifier_gradient
-                        print('reweighting by the gradient of classifier', classifier_gradient.min(), classifier_gradient.max())
+                        #print('weighting by the gradient of classifier', classifier_gradient.min(), classifier_gradient.max())
+                        #classifier_gradient = (classifier_gradient - classifier_gradient.min()) / (classifier_gradient.max() - classifier_gradient.min())
+                        #classifier_gradient = 1 - classifier_gradient
+                        #print('reweighting by the gradient of classifier', classifier_gradient.min(), classifier_gradient.max(), classifier_gradient.shape)
 
+                        #print('shapes reweighting', classifier_gradient.shape, (masked_background - self.init_image).shape, ((masked_background - self.init_image)*classifier_gradient).shape)
                         loss = (
                             loss
-                            + (((masked_background - self.init_image)*classifier_gradient).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda
+                            + ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda
                             #+ mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda
                         )
-                        #print('1.5 scaled loss', ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda)
-                        print('mse scaled loss', mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda)
+                        print('1.5 scaled loss', ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda)
+
+                        #print('mse scaled loss', mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda)
                         print('total losss', loss)
 
                 return -torch.autograd.grad(loss, x)[0]
@@ -656,7 +660,23 @@ class ImageEditor:
                 out["sample"] = out["sample"] * self.mask + background_stage_t * (1 - self.mask)
                 # try l2 projection
                 #eps = 1500 / 75
-                #print('projecting', max(eps*t[0], 160), t[0])
+
+                """
+                print('projecting', 135*out["sample"].abs().max())
+                print('sample min, max before',
+                      (out["sample"] - background_stage_t).view(out["sample"].shape[0], -1).norm(p=2, dim=1),
+                      out["sample"].abs().max(), out["sample"].min(), out["sample"].max(),
+                      out["pred_xstart"].min(), out["pred_xstart"].max(),
+                      range_loss(out["pred_xstart"]).sum() * self.args.range_lambda)
+
+                out["sample"] = background_stage_t + project_perturbation(out["sample"] - background_stage_t, eps=135*out["sample"].abs().max(), p=2)
+                """
+                print('sample min, max after',
+                      (out["sample"] - background_stage_t).view(out["sample"].shape[0], -1).norm(p=2, dim=1),
+                      out["sample"].abs().max(), out["sample"].min(), out["sample"].max(),
+                      out["pred_xstart"].min(), out["pred_xstart"].max(),
+                      range_loss(out["pred_xstart"]).sum() * self.args.range_lambda)
+
                 #out["sample"] = background_stage_t + project_perturbation(out["sample"] * self.mask - background_stage_t * self.mask, eps=max(eps*t[0], 160), p=2)
             return out
 
