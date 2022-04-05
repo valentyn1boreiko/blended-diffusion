@@ -326,7 +326,7 @@ class GaussianDiffusion:
             return t.float() * (1000.0 / self.num_timesteps)
         return t
 
-    def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
+    def condition_mean(self, cond_fn, p_mean_var, x, t, range_t_add_grad=True, model_kwargs=None):
         """
         Compute the mean for the previous step, given a function cond_fn that
         computes the gradient of a conditional log probability with respect to
@@ -336,7 +336,10 @@ class GaussianDiffusion:
         This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
         """
         gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
-        new_mean = p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
+        print('gradient norms before', gradient.view(x.shape[0], -1).norm(p=2, dim=1))
+        gradient /= gradient.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1, 1)
+        print('gradient norms after', gradient.view(x.shape[0], -1).norm(p=2, dim=1))
+        new_mean = p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float() * 200
         return new_mean
 
     def condition_score(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
@@ -352,7 +355,15 @@ class GaussianDiffusion:
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
 
         eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
-        eps = eps - (1 - alpha_bar).sqrt() * cond_fn(x, self._scale_timesteps(t), **model_kwargs)
+
+        model_kwargs['eps'] = eps
+        gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
+        del model_kwargs['eps']
+        #print('gradient norms before', gradient.view(x.shape[0], -1).norm(p=2, dim=1))
+        #gradient /= gradient.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1, 1)
+        #print('gradient norms after', gradient.view(x.shape[0], -1).norm(p=2, dim=1))
+
+        eps = eps - (1 - alpha_bar).sqrt() * gradient.float()
 
         out = p_mean_var.copy()
         out["pred_xstart"] = self._predict_xstart_from_eps(x, t, eps)
@@ -360,7 +371,7 @@ class GaussianDiffusion:
         return out
 
     def p_sample(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None,
+        self, model, x, t, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, range_t_add_grad=True
     ):
         """
         Sample x_{t-1} from the model at the given timestep.
@@ -392,7 +403,7 @@ class GaussianDiffusion:
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
         if cond_fn is not None:
-            out["mean"] = self.condition_mean(cond_fn, out, x, t, model_kwargs=model_kwargs)
+            out["mean"] = self.condition_mean(cond_fn, out, x, t, range_t_add_grad=range_t_add_grad, model_kwargs=model_kwargs)
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
@@ -410,6 +421,8 @@ class GaussianDiffusion:
         skip_timesteps=0,
         init_image=None,
         randomize_class=False,
+        resizers=None,
+        range_t=0,
     ):
         """
         Generate samples from the model.
@@ -444,6 +457,8 @@ class GaussianDiffusion:
             skip_timesteps=skip_timesteps,
             init_image=init_image,
             randomize_class=randomize_class,
+            resizers=resizers,
+            range_t=range_t
         ):
             final = sample
         return final["sample"]
@@ -463,6 +478,8 @@ class GaussianDiffusion:
         init_image=None,
         postprocess_fn=None,
         randomize_class=False,
+        resizers=None,
+        range_t=0,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -472,6 +489,10 @@ class GaussianDiffusion:
         Returns a generator over dicts, where each dict is the return value of
         p_sample().
         """
+
+        if resizers is not None:
+            down, up = resizers
+
         if device is None:
             device = next(model.parameters()).device
         assert isinstance(shape, (tuple, list))
@@ -511,6 +532,7 @@ class GaussianDiffusion:
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
 
+            print('range grad', i, range_t, i > range_t)
             with th.no_grad():
                 out = self.p_sample(
                     model,
@@ -520,7 +542,17 @@ class GaussianDiffusion:
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
+                    range_t_add_grad=i <= range_t
                 )
+
+                #### ILVR ####
+                if resizers is not None:
+                    if i > range_t:
+                        print('using ILVR', i)
+                        out["sample"] = out["sample"] - up(down(out["sample"])) + up(
+                            down(self.q_sample(th.tile(init_image, dims=(batch_size, 1, 1, 1)), t, th.randn(*shape, device=device))))
+
+
                 if postprocess_fn is not None:
                     out = postprocess_fn(out, t)
 
@@ -574,6 +606,7 @@ class GaussianDiffusion:
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
+        print('min, max var', sigma.min(), sigma.max())
         sample = mean_pred + nonzero_mask * sigma * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
@@ -620,6 +653,7 @@ class GaussianDiffusion:
         skip_timesteps=0,
         init_image=None,
         randomize_class=False,
+        postprocess_fn=None
     ):
         """
         Generate samples from the model using DDIM.
@@ -641,6 +675,7 @@ class GaussianDiffusion:
             skip_timesteps=skip_timesteps,
             init_image=init_image,
             randomize_class=randomize_class,
+            postprocess_fn=postprocess_fn
         ):
             final = sample
         return final["sample"]
@@ -660,6 +695,9 @@ class GaussianDiffusion:
         skip_timesteps=0,
         init_image=None,
         randomize_class=False,
+        resizers=None,
+        range_t=0,
+        postprocess_fn=None
     ):
         """
         Use DDIM to sample from the model and yield intermediate samples from
@@ -667,6 +705,10 @@ class GaussianDiffusion:
 
         Same usage as p_sample_loop_progressive().
         """
+
+        if resizers is not None:
+            down, up = resizers
+
         if device is None:
             device = next(model.parameters()).device
         assert isinstance(shape, (tuple, list))
@@ -676,13 +718,21 @@ class GaussianDiffusion:
             img = th.randn(*shape, device=device)
         indices = list(range(self.num_timesteps))[::-1]
 
+        batch_size = shape[0]
+        init_image_batch = th.tile(init_image, dims=(batch_size, 1, 1, 1))
+        img = self.q_sample(
+            x_start=init_image_batch,
+            t=th.tensor(indices[0], dtype=th.long, device=device),
+            noise=img,
+        )
+
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
 
             indices = tqdm(indices)
 
-        for i in indices:
+        for j, i in enumerate(indices):
             t = th.tensor([i] * shape[0], device=device)
             if randomize_class and "y" in model_kwargs:
                 model_kwargs["y"] = th.randint(
@@ -703,6 +753,21 @@ class GaussianDiffusion:
                     eta=eta,
                 )
                 yield out
+
+                #### ILVR ####
+                if resizers is not None and False:
+                    if i > range_t:
+                        print('using ILVR', i)
+                        in_ = out["sample"]
+                        with th.enable_grad():
+                            in_.requires_grad_(True)
+                            diff = - up(down(in_)) + up(
+                            down(self.q_sample(th.tile(init_image, dims=(batch_size, 1, 1, 1)), t,
+                                               th.randn(*shape, device=device))))
+                        grad_temp = th.autograd.grad((0.5*diff.reshape(img.shape[0], -1).norm(p=2, dim=1)**2).sum(), in_)[0]
+                        out["sample"] = out["sample"] - grad_temp
+
+
                 img = out["sample"]
 
     def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None):

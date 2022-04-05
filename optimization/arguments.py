@@ -163,6 +163,8 @@ def get_arguments() -> argparse.Namespace:
         model_epoch_num=0,
         device_ids=None,
         script_type='sampling',
+        range_t=0,
+        down_N=32
     )
 
     add_dict_to_argparser(parser, defaults)

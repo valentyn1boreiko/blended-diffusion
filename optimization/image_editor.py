@@ -1,6 +1,8 @@
+import math
 import os, inspect, sys
 from pathlib import Path
 from optimization.constants import ASSETS_DIR_NAME, RANKED_RESULTS_DIR
+from torch.utils.tensorboard import SummaryWriter
 
 from utils_blended.metrics_accumulator import MetricsAccumulator
 from utils_blended.video import save_video
@@ -17,6 +19,7 @@ from torch.nn.functional import mse_loss
 from optimization.losses import range_loss, d_clip_loss
 import lpips
 import numpy as np
+from resizer import Resizer
 
 from CLIP import clip
 from guided_diffusion.guided_diffusion.script_util import (
@@ -33,6 +36,23 @@ print(sys.path)
 from configs import get_config
 from utils.Evaluator import Evaluator
 from utils_blended.model_normalization import ResizeWrapper
+from torch.utils.tensorboard.summary import hparams
+
+class SummaryWriter(SummaryWriter):
+    def add_hparams(self, hparam_dict, metric_dict):
+        torch._C._log_api_usage_once("tensorboard.logging.add_hparams")
+        if type(hparam_dict) is not dict or type(metric_dict) is not dict:
+            raise TypeError('hparam_dict and metric_dict should be dictionary.')
+        exp, ssi, sei = hparams(hparam_dict, metric_dict)
+
+        logdir = self._get_file_writer().get_logdir()
+
+        with SummaryWriter(log_dir=logdir) as w_hp:
+            w_hp.file_writer.add_summary(exp)
+            w_hp.file_writer.add_summary(ssi)
+            w_hp.file_writer.add_summary(sei)
+            for k, v in metric_dict.items():
+                w_hp.add_scalar(k, v)
 
 class_labels = ['tench, Tinca tinca', 'goldfish, Carassius auratus',
                'great white shark, white shark, man-eater, man-eating shark, Carcharodon carcharias',
@@ -405,7 +425,9 @@ class ImageEditor:
         self.args = args
         self.probs = None
         self.y = None
+        self.tensorboard_counter = 0
         os.makedirs(self.args.output_path, exist_ok=True)
+        self.writer = SummaryWriter(self.args.output_path)
 
         self.ranked_results_path = Path(os.path.join(self.args.output_path, RANKED_RESULTS_DIR))
         os.makedirs(self.ranked_results_path, exist_ok=True)
@@ -479,6 +501,16 @@ class ImageEditor:
         self.classifier = classifier
         self.classifier.to(self.device)
 
+        ### ILVR resizers
+        print("creating resizers...")
+        assert math.log(self.args.down_N, 2).is_integer()
+
+        shape = (self.args.batch_size, 3, self.model_config["image_size"], self.model_config["image_size"])
+        shape_d = (self.args.batch_size, 3, int(self.model_config["image_size"] / self.args.down_N), int(self.model_config["image_size"] / self.args.down_N))
+        down = Resizer(shape, 1 / self.args.down_N).to(self.device)
+        up = Resizer(shape_d, self.args.down_N).to(self.device)
+        self.resizers = (down, up)
+        ### ILVR resizers
 
         self.clip_size = self.clip_model.visual.input_resolution
         self.clip_normalize = transforms.Normalize(
@@ -488,6 +520,7 @@ class ImageEditor:
 
         self.image_augmentations = ImageAugmentations(self.clip_size, self.args.aug_num)
         self.metrics_accumulator = MetricsAccumulator()
+
 
     def unscale_timestep(self, t):
         unscaled_timestep = (t * (self.diffusion.num_timesteps / 1000)).long()
@@ -558,30 +591,49 @@ class ImageEditor:
                 )
                 self.mask_pil.save(mask_path)
 
+        def cond_fn(x, t, y=None, eps=None):
 
-        def cond_fn(x, t, y=None):
             if self.args.prompt == "":
                 return torch.zeros_like(x)
 
-            with torch.enable_grad():
-                x = x.detach().requires_grad_()
-                t = self.unscale_timestep(t)
+            if y is not None:
+                assert torch.all(y == y[0])
 
-                out = self.diffusion.p_mean_variance(
-                    self.model, x, t, clip_denoised=False, model_kwargs={"y": y}
-                )
 
-                fac = self.diffusion.sqrt_one_minus_alphas_cumprod[t[0].item()]
-                x_in = out["pred_xstart"] * fac + x * (1 - fac)
-                # x_in = out["pred_xstart"]
+            # x_in = out["pred_xstart"]
 
-                loss = torch.tensor(0)
-                if self.args.clip_guidance_lambda != 0:
+            grad_out = torch.zeros_like(x)
+
+            if self.args.clip_guidance_lambda != 0:
+                with torch.enable_grad():
+                    x = x.detach().requires_grad_()
+                    t = self.unscale_timestep(t)
+
+                    out = self.diffusion.p_mean_variance(
+                        self.model, x, t, clip_denoised=False, model_kwargs={"y": y}
+                    )
+
+                    fac = self.diffusion.sqrt_one_minus_alphas_cumprod[t[0].item()]
+                    x_in = out["pred_xstart"] * fac + x * (1 - fac)
                     print('using clip guidance')
-                    clip_loss = self.clip_loss(x_in, text_embed) * self.args.clip_guidance_lambda
-                    loss = loss + clip_loss
+                    clip_loss = self.clip_loss(x_in, text_embed) #* self.args.clip_guidance_lambda
+                    grad_temp = torch.autograd.grad(clip_loss, x)[0].detach()
+                    grad_temp /= grad_temp.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1, 1)
+                    grad_temp *= self.args.clip_guidance_lambda
+                    grad_out -= grad_temp
+                    #loss = loss + clip_loss
                     self.metrics_accumulator.update_metric("clip_loss", clip_loss.item())
-                if self.args.classifier_lambda != 0:
+            if self.args.classifier_lambda != 0:
+                with torch.enable_grad():
+                    x = x.detach().requires_grad_()
+                    t = self.unscale_timestep(t)
+
+                    out = self.diffusion.p_mean_variance(
+                        self.model, x, t, clip_denoised=False, model_kwargs={"y": y}
+                    )
+
+                    fac = self.diffusion.sqrt_one_minus_alphas_cumprod[t[0].item()]
+                    x_in = out["pred_xstart"] * fac + x * (1 - fac)
                     loss_temp = torch.tensor(0.0).to(self.device)
                     if self.mask is not None:
                         masked_input = x_in * self.mask
@@ -600,20 +652,59 @@ class ImageEditor:
                     print('probs', logits[:self.args.batch_size].softmax(1)[range(self.args.batch_size), y.view(-1)])
                     print('dist', (self.init_image-x_in).view(len(logits), -1).norm(p=2, dim=1))
                     self.probs = logits[:self.args.batch_size].softmax(1)[range(self.args.batch_size), y.view(-1)]
-                    self.y = y
-                    classifier_loss = loss_temp * self.args.classifier_lambda
-                    loss = loss - classifier_loss
-                    self.metrics_accumulator.update_metric("classifier_loss", classifier_loss.item())
-                #classifier_gradient = -torch.autograd.grad(loss, x, retain_graph=True)[0].detach()
-                #with torch.enable_grad():
-                #    x = x.detach().requires_grad_()
+                    probs_per_image = {str(i_val[0]): i_val[1].item() for i_val in enumerate(self.probs)}
 
-                if self.args.range_lambda != 0:
-                    r_loss = range_loss(out["pred_xstart"]).sum() * self.args.range_lambda
-                    loss = loss + r_loss
+                    self.writer.add_scalars('Probs,classifier', probs_per_image, self.tensorboard_counter)
+
+                    self.y = y
+                    classifier_loss = loss_temp #* self.args.classifier_lambda
+                    grad_temp = torch.autograd.grad(classifier_loss, x)[0].detach()
+
+                    norms_per_image = {str(i_val[0]): i_val[1].item() for i_val in enumerate(grad_temp.view(x.shape[0], -1).norm(p=2, dim=1))}
+                    print('gradient classifier norms before', norms_per_image)
+                    self.writer.add_scalars('Gradients of norm' + ', seed:' + str(self.args.seed) +', l1.5 Regularization, class:'+class_labels[y[0]]+'/classifier', norms_per_image, self.tensorboard_counter)
+
+                    grad_temp /= grad_temp.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1, 1)
+                    grad_temp *= self.args.classifier_lambda
+                    print('gradient classifier norms after', grad_temp.view(x.shape[0], -1).norm(p=2, dim=1))
+
+                    grad_out += grad_temp
+                    #loss = loss - classifier_loss
+                    self.metrics_accumulator.update_metric("classifier_loss", classifier_loss.item())
+            #classifier_gradient = -torch.autograd.grad(loss, x, retain_graph=True)[0].detach()
+            #with torch.enable_grad():
+            #    x = x.detach().requires_grad_()
+
+            if self.args.range_lambda != 0:
+                with torch.enable_grad():
+                    x = x.detach().requires_grad_()
+                    t = self.unscale_timestep(t)
+
+                    out = self.diffusion.p_mean_variance(
+                        self.model, x, t, clip_denoised=False, model_kwargs={"y": y}
+                    )
+
+                    fac = self.diffusion.sqrt_one_minus_alphas_cumprod[t[0].item()]
+                    x_in = out["pred_xstart"] * fac + x * (1 - fac)
+                    r_loss = range_loss(out["pred_xstart"]).sum() #* self.args.range_lambda
+                    grad_temp = torch.autograd.grad(r_loss, x)[0].detach()
+                    grad_temp /= grad_temp.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1, 1)
+                    grad_temp *= self.args.range_lambda
+                    grad_out -= grad_temp
+                    #loss = loss + r_loss
                     self.metrics_accumulator.update_metric("range_loss", r_loss.item())
 
-                if self.args.background_preservation_loss:
+            if self.args.background_preservation_loss:
+                with torch.enable_grad():
+                    x = x.detach().requires_grad_()
+                    t = self.unscale_timestep(t)
+
+                    out = self.diffusion.p_mean_variance(
+                        self.model, x, t, clip_denoised=False, model_kwargs={"y": y}
+                    )
+
+                    fac = self.diffusion.sqrt_one_minus_alphas_cumprod[t[0].item()]
+                    x_in = out["pred_xstart"] * fac + x * (1 - fac)
                     if self.mask is not None:
                         print('using mask')
                         ##masked_background = x_in * (1 - self.mask)
@@ -623,11 +714,24 @@ class ImageEditor:
                         masked_background = x_in
 
                     if self.args.lpips_sim_lambda:
-                        loss = (
-                            loss
-                            + self.lpips_model(masked_background, self.init_image).sum()
-                            * self.args.lpips_sim_lambda
-                        )
+
+                        #loss = (
+                        #    loss
+                        #    + self.lpips_model(masked_background, self.init_image).sum()
+                        #    * self.args.lpips_sim_lambda
+                        #)
+
+                        grad_temp =  torch.autograd.grad(self.lpips_model(masked_background, self.init_image).sum(), x)[0].detach()
+                        norms_per_image = {str(i_val[0]): i_val[1].item() for i_val in
+                                           enumerate(grad_temp.view(x.shape[0], -1).norm(p=2, dim=1))}
+                        print('gradient lpips norms before', norms_per_image)
+                        self.writer.add_scalars('Gradients of norm'+ ', seed:' + str(self.args.seed) +', l1.5 Regularization,class:' + class_labels[y[0]]+'/lpips',
+                                                norms_per_image, self.tensorboard_counter)
+
+                        grad_temp /= grad_temp.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1,
+                                                                                          1)
+                        grad_temp *= self.args.lpips_sim_lambda
+                        grad_out -= grad_temp
                     if self.args.l2_sim_lambda:
                         print('using l2 sim', self.args.l2_sim_lambda)
 
@@ -637,17 +741,51 @@ class ImageEditor:
                         #print('reweighting by the gradient of classifier', classifier_gradient.min(), classifier_gradient.max(), classifier_gradient.shape)
 
                         #print('shapes reweighting', classifier_gradient.shape, (masked_background - self.init_image).shape, ((masked_background - self.init_image)*classifier_gradient).shape)
-                        loss = (
-                            loss
-                            + ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda
-                            #+ mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda
-                        )
-                        print('1.5 scaled loss', ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda)
+                        #loss = (
+                        #    loss
+                        #    + ((masked_background - self.init_image).view(len(self.init_image), -1).norm(p=1.5, dim=1)**1.5).mean() * self.args.l2_sim_lambda
+                        #    #+ mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda
+                        #)
+                        grad_temp =  torch.autograd.grad(((masked_background - self.init_image).view(x.shape[0], -1).norm(p=1.5, dim=1)**1.5).mean(), x)[0].detach()
+                        #grad_temp = torch.autograd.grad(((x - self.diffusion.q_sample(torch.tile(self.init_image, dims=(x.shape[0], 1, 1, 1)), t,
+                        #                       torch.randn(*x.shape, device=self.device))).view(1,-1).norm(p=1.5,dim=1) ** 1.5).mean(), x)[0].detach()
+
+                        norms_per_image = {str(i_val[0]): i_val[1].item() for i_val in
+                                           enumerate(grad_temp.view(x.shape[0], -1).norm(p=2, dim=1))}
+                        print('gradient l1.5 norms before', norms_per_image)
+                        self.writer.add_scalars(
+                            'Gradients of norm' + ', seed:' + str(self.args.seed) + ', l1.5 Regularization,class:' +
+                            class_labels[y[0]] + '/l1.5',
+                            norms_per_image, self.tensorboard_counter)
+
+                        #grad_temp /= grad_temp.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1,
+                        #                                                                  1)
+                        grad_temp *= self.args.l2_sim_lambda
+                        grad_out -= grad_temp
+                        print('1.5 scaled loss', (
+                                    (masked_background - self.init_image).view(x.shape[0], -1).norm(p=1.5,
+                                                                                                              dim=1) ** 1.5).mean() * self.args.l2_sim_lambda)
+
+                norms_per_image = {str(i_val[0]): i_val[1].item() for i_val in
+                                   enumerate((x_in - self.init_image).view(x.shape[0], -1).norm(p=1.5,
+                                                                                                              dim=1))}
+                print('l1.5', len(self.init_image), x.shape[0], norms_per_image)
+
+                self.writer.add_scalars(
+                    'l1.5 distance',
+                    norms_per_image, self.tensorboard_counter)
+
+                norms_per_image = {str(i_val[0]): i_val[1].item() for i_val in
+                                   enumerate(eps.view(x.shape[0], -1).norm(p=2,
+                                                                                                  dim=1))}
+                print('scorenet', norms_per_image)
+                self.writer.add_scalars('scorenet norm', norms_per_image, self.tensorboard_counter)
 
                         #print('mse scaled loss', mse_loss(masked_background, self.init_image) * self.args.l2_sim_lambda)
-                        print('total losss', loss)
+                print('total losss', grad_out.view(x.shape[0], -1).norm(p=2, dim=1))
 
-                return -torch.autograd.grad(loss, x)[0]
+                self.tensorboard_counter += 1
+                return grad_out #-torch.autograd.grad(loss, x)[0]
 
         @torch.no_grad()
         def postprocess_fn(out, t):
@@ -686,8 +824,8 @@ class ImageEditor:
             # Here iterate over the dataloader of ImageNet-S
 
             print(f"Start iteration {iteration_number}")
-
-            samples = self.diffusion.p_sample_loop_progressive(
+            self.tensorboard_counter = 0
+            samples = self.diffusion.ddim_sample_loop_progressive(#p_sample_loop_progressive(
                 self.model,
                 (
                     self.args.batch_size,
@@ -708,11 +846,14 @@ class ImageEditor:
                 init_image=self.init_image,
                 postprocess_fn=None if self.args.local_clip_guided_diffusion else postprocess_fn,
                 randomize_class=False,
+                resizers=self.resizers,
+                range_t=self.args.range_t
             )
 
             intermediate_samples = [[] for i in range(self.args.batch_size)]
             total_steps = self.diffusion.num_timesteps - self.args.skip_timesteps - 1
             for j, sample in enumerate(samples):
+                self.writer.add_images('images', sample["pred_xstart"].add(1).div(2).clamp(0, 1), j)
                 should_save_image = j % save_image_interval == 0 or j == total_steps
                 if should_save_image or self.args.save_video:
                     self.metrics_accumulator.print_average_metric()
@@ -777,6 +918,9 @@ class ImageEditor:
                     )
                     video_path = os.path.join(self.args.output_path, video_name)
                     save_video(intermediate_samples[b], video_path)
+
+            self.writer.flush()
+            self.writer.close()
 
     def reconstruct_image(self):
         init = Image.open(self.args.init_image).convert("RGB")
