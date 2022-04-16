@@ -335,11 +335,16 @@ class GaussianDiffusion:
 
         This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
         """
+        eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
+
+        model_kwargs['eps'] = eps
         gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
-        print('gradient norms before', gradient.view(x.shape[0], -1).norm(p=2, dim=1))
-        gradient /= gradient.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1, 1)
-        print('gradient norms after', gradient.view(x.shape[0], -1).norm(p=2, dim=1))
-        new_mean = p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float() * 200
+        del model_kwargs['eps']
+
+        #print('gradient norms before', gradient.view(x.shape[0], -1).norm(p=2, dim=1))
+        #gradient /= gradient.view(x.shape[0], -1).norm(p=2, dim=1).view(x.shape[0], 1, 1, 1)
+        #print('gradient norms after', gradient.view(x.shape[0], -1).norm(p=2, dim=1))
+        new_mean = p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float() #* 200
         return new_mean
 
     def condition_score(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
@@ -546,7 +551,7 @@ class GaussianDiffusion:
                 )
 
                 #### ILVR ####
-                if resizers is not None:
+                if resizers is not None and False:
                     if i > range_t:
                         print('using ILVR', i)
                         out["sample"] = out["sample"] - up(down(out["sample"])) + up(
@@ -716,7 +721,8 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        indices = list(range(self.num_timesteps))[::-1]
+        ##indices = list(range(self.num_timesteps))[::-1]
+        indices = list(range(self.num_timesteps - skip_timesteps))[::-1]
 
         batch_size = shape[0]
         init_image_batch = th.tile(init_image, dims=(batch_size, 1, 1, 1))
@@ -767,6 +773,8 @@ class GaussianDiffusion:
                         grad_temp = th.autograd.grad((0.5*diff.reshape(img.shape[0], -1).norm(p=2, dim=1)**2).sum(), in_)[0]
                         out["sample"] = out["sample"] - grad_temp
 
+                if postprocess_fn is not None:
+                    out = postprocess_fn(out, t)
 
                 img = out["sample"]
 
